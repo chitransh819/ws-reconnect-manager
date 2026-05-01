@@ -1,33 +1,27 @@
-# smart-api-limiter
+# ws-reconnect-manager
 
-`smart-api-limiter` is an async Python toolkit for both sides of API rate
-control:
+`ws-reconnect-manager` is a reliable asyncio WebSocket client for long-running
+apps, bots, dashboards, workers, and services that must stay connected.
 
-- client side: an `httpx` wrapper that queues outgoing calls, waits for rate
-  limit capacity, retries transient failures, and respects `Retry-After`.
-- server side: ASGI middleware that protects incoming endpoints with token
-  buckets, `429` responses, and standard rate-limit headers.
-
-Install one package, then import only the side your app needs.
+It reconnects automatically, sends heartbeats, detects dead sockets, and exposes
+small lifecycle hooks so your app can resubscribe or restore state after every
+reconnect.
 
 ## Features
 
-- outgoing async API client powered by `httpx`
-- client token-bucket throttling
-- bounded request concurrency
-- retry with exponential backoff and jitter
-- `Retry-After` support
-- incoming ASGI rate limiting middleware
-- per-IP, per-user, per-API-key, or per-tenant limiting
-- endpoint-specific limits and request costs
-- `Retry-After` and `X-RateLimit-*` response headers
-- framework-agnostic support for FastAPI, Starlette, Litestar, Autowire, and
-  other ASGI apps
+- automatic reconnects with exponential backoff and jitter
+- heartbeat sends using ping, text, bytes, or JSON payloads
+- dead connection detection when the socket stops producing frames
+- callback hooks for connect, message, disconnect, retry, dead socket, and fatal
+  errors
+- safe send helpers that raise `NotConnected` while reconnecting
+- dynamic auth headers for refreshed tokens
+- clean `DoNotReconnect` escape hatch for fatal protocol errors
 
 ## Install
 
 ```bash
-pip install smart-api-limiter
+pip install ws-reconnect-manager
 ```
 
 For local development:
@@ -37,101 +31,114 @@ pip install -e ".[test]"
 pytest
 ```
 
-## Client-Side Usage
+## Quick Start
 
 ```python
 import asyncio
 
-from smart_api_limiter import AsyncAPIClient, ClientRateLimitConfig, RetryConfig
+from ws_reconnect_manager import ReconnectingWebSocketClient
 
 
 async def main() -> None:
-    async with AsyncAPIClient(
-        base_url="https://api.example.com",
-        rate_limit=ClientRateLimitConfig(rate=10, period=1, burst=10),
-        retry=RetryConfig(max_attempts=4),
-        max_concurrency=5,
-    ) as api:
-        response = await api.get("/v1/users", params={"limit": 50})
-        response.raise_for_status()
-        print(response.json())
+    client = ReconnectingWebSocketClient(
+        "wss://example.com/events",
+        headers={"authorization": "Bearer token"},
+        heartbeat_payload={"type": "ping"},
+        heartbeat_interval=15,
+        dead_timeout=20,
+    )
+
+    async def on_connect(client) -> None:
+        await client.send_json({"type": "subscribe", "topic": "notifications"})
+
+    async def on_message(message, ws) -> None:
+        print(message.data)
+
+    await client.run(on_connect=on_connect, on_message=on_message)
 
 
 asyncio.run(main())
 ```
 
-Wrap an existing `httpx.AsyncClient`:
+## Dynamic Auth Headers
+
+Pass a function when tokens may refresh between reconnect attempts.
 
 ```python
-import httpx
-
-from smart_api_limiter import AsyncAPIClient
-
-
-async with httpx.AsyncClient(base_url="https://api.example.com") as http:
-    api = AsyncAPIClient(client=http)
-    response = await api.post("/jobs", json={"name": "nightly-sync"})
-```
-
-## Server-Side Usage
-
-```python
-from smart_api_limiter import RateLimit, RateLimitMiddleware
+async def headers():
+    token = await load_fresh_token()
+    return {"authorization": f"Bearer {token}"}
 
 
-app = RateLimitMiddleware(
-    app,
-    default_limit=RateLimit(rate=120, period=60),
+client = ReconnectingWebSocketClient(
+    "wss://example.com/ws",
+    headers=headers,
 )
 ```
 
-## Endpoint-Specific Limits
+## Stop Reconnecting For Fatal Protocol Errors
+
+Raise `DoNotReconnect` from a message handler when the server sends an
+unrecoverable error.
 
 ```python
-from smart_api_limiter import RateLimit, RateLimitMiddleware
+from ws_reconnect_manager import DoNotReconnect
 
 
-def rule_for(scope):
-    if scope["path"].startswith("/auth/login"):
-        return RateLimit(rate=5, period=60)
-    if scope["path"].startswith("/reports"):
-        return RateLimit(rate=10, period=300)
-    return RateLimit(rate=120, period=60)
-
-
-app = RateLimitMiddleware(app, rule_for=rule_for)
+async def on_message(message, ws) -> None:
+    if message.type.name == "TEXT" and "invalid token" in message.data:
+        raise DoNotReconnect("server rejected credentials")
 ```
 
-## API-Key/User Aware Limits
+## Manual Sends
+
+The current connected socket is available through safe helpers. They raise
+`NotConnected` if a reconnect is in progress.
 
 ```python
-def key_for(scope):
-    headers = dict(scope.get("headers") or [])
-    api_key = headers.get(b"x-api-key")
-    if api_key:
-        return api_key.decode(errors="ignore")
-
-    user = scope.get("user")
-    if user:
-        return f"user:{user['id']}"
-
-    client = scope.get("client")
-    return client[0] if client else "anonymous"
-
-
-app = RateLimitMiddleware(app, key_for=key_for)
+await client.send_json({"type": "subscribe", "topic": "room"})
+await client.send_str("hello")
+await client.send_bytes(b"hello")
 ```
+
+## Configuration
+
+```python
+from ws_reconnect_manager import Heartbeat, ReconnectPolicy
+
+
+client = ReconnectingWebSocketClient(
+    "wss://example.com/ws",
+    heartbeat=Heartbeat(interval=15, payload={"type": "ping"}),
+    reconnect=ReconnectPolicy(
+        initial_delay=1,
+        max_delay=60,
+        factor=2,
+        jitter=0.2,
+        max_attempts=None,
+    ),
+)
+```
+
+## How It Fits With Servers
+
+This package focuses on the reconnecting client. Your server can be any
+WebSocket server: Autowire, FastAPI, Starlette, Django Channels, aiohttp, or a
+custom ASGI app. On reconnect, use `on_connect` to resubscribe or ask the server
+for missed state.
+
+For Autowire projects, pair this with Autowire's notification store so pending
+messages are flushed when the reconnecting client comes back online.
 
 ## Project Structure
 
 ```text
-smart-api-limiter/
+ws-reconnect-manager/
   src/
-    smart_api_limiter/
-      client/          # outgoing HTTP client wrapper
-      limiter.py       # in-memory token bucket
-      middleware.py    # ASGI middleware
-      policies.py      # server-side policy objects
+    ws_reconnect_manager/
+      client.py
+      exceptions.py
+      policies.py
       __init__.py
   tests/
   pyproject.toml
